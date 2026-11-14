@@ -1,0 +1,33 @@
+name: ensemble-forecast
+# Hourly snapshot of the ECMWF ensemble at every market's resolution station.
+# Independent of the order-book logger chain in log.yml on purpose: a failure
+# here must never disturb book/METAR logging, and vice versa.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: ensemble
+  cancel-in-progress: false
+jobs:
+  ensemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - run: node ensemble.mjs
+      - name: Commit ensemble snapshot
+        run: |
+          git config user.name "polyscalp-bot"
+          git config user.email "polyscalp-bot@users.noreply.github.com"
+          git add data/ensemble
+          if ! git diff --cached --quiet; then
+            git commit -q -m "ensemble $(date -u +%Y-%m-%dT%H:%MZ)"
+            for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
+          fi
