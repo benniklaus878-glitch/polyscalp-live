@@ -1,0 +1,56 @@
+name: probe-resting-fills
+# Certainty-seller resting-fill PAPER probe (probe.mjs). No wallet, no keys,
+# no real orders — it rests pretend sell orders and measures real fills from
+# public trade prints.
+#
+# Self-chaining like log.yml: GitHub's scheduled runs are best-effort (the
+# forecast workflows fired only ~4x/day on schedule alone), so each run
+# stays alive ~5h40m, runs one probe cycle every 10 minutes (pull -> probe
+# -> commit -> push), then dispatches the next run. The hourly schedule is
+# only a backup restart in case the chain ever breaks (GitHub keeps at most
+# one queued run per concurrency group, so the chain never doubles up).
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - name: Probe cycle every 10 minutes for ~5h40m
+        run: |
+          git config user.name "polyscalp-bot"
+          git config user.email "polyscalp-bot@users.noreply.github.com"
+          end=$((SECONDS + 20400))
+          while [ $SECONDS -lt $end ]; do
+            start=$SECONDS
+            git pull -q --rebase || echo "pull failed, continuing on local state"
+            node probe.mjs || echo "probe run failed, continuing"
+            git add data/probe
+            if ! git diff --cached --quiet; then
+              git commit -q -m "probe $(date -u +%Y-%m-%dT%H:%MZ)"
+              for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
+            fi
+            wait=$((600 - (SECONDS - start)))
+            [ $wait -gt 0 ] && sleep $wait
+          done
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/probe.yml/dispatches" \
+            -d '{"ref":"main"}'
