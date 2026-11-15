@@ -2,32 +2,61 @@ name: ensemble-forecast
 # Hourly snapshot of the ECMWF ensemble at every market's resolution station.
 # Independent of the order-book logger chain in log.yml on purpose: a failure
 # here must never disturb book/METAR logging, and vice versa.
+#
+# CADENCE FIX (2026-11-15): the previous version relied on the hourly
+# `schedule:` trigger alone, and GitHub's scheduler is best-effort — in the
+# first 25h of operation it fired only 4 times (runs ~4-8h apart instead of
+# hourly; verified in the 24h check). This version self-chains exactly like
+# log.yml (which hit 151/151 slots in the same window): each run stays
+# alive ~5h40m, sleeps until each :23 past the hour, runs ensemble.mjs,
+# commits, and finally dispatches the next run. The hourly cron remains
+# only as a backup restart (GitHub keeps at most one queued run per
+# concurrency group, so the chain never doubles up).
 on:
   schedule:
     - cron: '23 * * * *'
   workflow_dispatch: {}
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: ensemble
   cancel-in-progress: false
 jobs:
   ensemble:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
       - run: npm install --no-audit --no-fund
-      - run: node ensemble.mjs
-      - name: Commit ensemble snapshot
+      - name: Run at :23 past every hour for ~5h40m
         run: |
           git config user.name "polyscalp-bot"
           git config user.email "polyscalp-bot@users.noreply.github.com"
-          git add data/ensemble
-          if ! git diff --cached --quiet; then
-            git commit -q -m "ensemble $(date -u +%Y-%m-%dT%H:%MZ)"
-            for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
-          fi
+          end=$((SECONDS + 20400))
+          while [ $SECONDS -lt $end ]; do
+            min=$(date -u +%M); sec=$(date -u +%S)
+            sih=$((10#$min * 60 + 10#$sec))
+            wait=$(( (1380 - sih + 3600) % 3600 ))
+            [ $wait -gt $((end - SECONDS)) ] && break
+            sleep $wait
+            [ $SECONDS -ge $end ] && break
+            git pull -q --rebase || echo "pull failed, continuing"
+            node ensemble.mjs || echo "ensemble run failed, continuing"
+            git add data/ensemble
+            if ! git diff --cached --quiet; then
+              git commit -q -m "ensemble $(date -u +%Y-%m-%dT%H:%MZ)"
+              for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
+            fi
+          done
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ensemble.yml/dispatches" \
+            -d '{"ref":"main"}'
