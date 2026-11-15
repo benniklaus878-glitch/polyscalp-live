@@ -1,38 +1,61 @@
 name: log-multisource
-
+# Hourly multisource forecast snapshot (wttr.in, MET Norway, 7Timer, NOAA
+# NWS for US cities) — the mode-of-sources feed.
+#
+# CADENCE FIX (2026-11-15): the previous version relied on the hourly
+# `schedule:` trigger alone, and GitHub's scheduler is best-effort — in the
+# first 25h of operation it fired only 4 times (runs ~4-8h apart instead of
+# hourly; verified in the 24h check). This version self-chains exactly like
+# log.yml (which hit 151/151 slots in the same window): each run stays
+# alive ~5h40m, sleeps until each :37 past the hour, runs multisource.mjs,
+# commits, and finally dispatches the next run. The hourly cron remains
+# only as a backup restart (GitHub keeps at most one queued run per
+# concurrency group, so the chain never doubles up).
 on:
   schedule:
     - cron: '37 * * * *'
   workflow_dispatch: {}
-
 permissions:
   contents: write
-
+  actions: write
 concurrency:
   group: multisource
   cancel-in-progress: false
-
 jobs:
   log-multisource:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - run: npm install --no-audit --no-fund
-
-      - run: node multisource.mjs
-
-      - name: Commit multisource data
+      - name: Run at :37 past every hour for ~5h40m
         run: |
           git config user.name "polyscalp-bot"
           git config user.email "polyscalp-bot@users.noreply.github.com"
-          git add data/multisource
-          if ! git diff --cached --quiet; then
-            git commit -m "multisource $(date -u +%Y-%m-%dT%H:%MZ)"
-            for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
-          fi
+          end=$((SECONDS + 20400))
+          while [ $SECONDS -lt $end ]; do
+            min=$(date -u +%M); sec=$(date -u +%S)
+            sih=$((10#$min * 60 + 10#$sec))
+            wait=$(( (2220 - sih + 3600) % 3600 ))
+            [ $wait -gt $((end - SECONDS)) ] && break
+            sleep $wait
+            [ $SECONDS -ge $end ] && break
+            git pull -q --rebase || echo "pull failed, continuing"
+            node multisource.mjs || echo "multisource run failed, continuing"
+            git add data/multisource
+            if ! git diff --cached --quiet; then
+              git commit -q -m "multisource $(date -u +%Y-%m-%dT%H:%MZ)"
+              for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
+            fi
+          done
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/multisource.yml/dispatches" \
+            -d '{"ref":"main"}'
